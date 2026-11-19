@@ -39,6 +39,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -74,6 +75,14 @@ interface BluetoothFacade {
     fun stopScan()
     fun connectToSavedDevice()
     fun attemptAutoConnectToSavedDevice()
+
+    /**
+     * Connects to the saved scale without any UI (background measurement). Unlike
+     * [connectToSavedDevice] it does not rely on a subscribed UI: it reads the saved device from
+     * the settings and waits until the selected user is known, so the measurement is stored for
+     * the right user. Returns false if there is no saved device or no user.
+     */
+    suspend fun connectToSavedDeviceInBackground(): Boolean
     fun disconnect()
     fun saveAsPreferred(device: ScannedDeviceInfo)
     fun removeSavedDevice()
@@ -208,30 +217,51 @@ class BluetoothFacadeImpl @Inject constructor(
                 LogManager.d(TAG, "No saved device snapshot found.")
                 return@launch
             }
-
-            val already = (connectionStatus.value == ConnectionStatus.CONNECTED ||
-                    connectionStatus.value == ConnectionStatus.CONNECTING) &&
-                    connectedDeviceAddress.value == dev.address
-            if (already) return@launch
-
-            // Developer mode has to reach unsupported scales too – that is its whole point.
-            val developerMode = settingsFacade.developerModeEnabled.first()
-            val (supported, handlerName) = scaleFactory.getSupportingHandlerInfo(dev)
-            if (!supported && !developerMode) {
-                LogManager.w(TAG, "Saved device '${dev.name}' is not recognized as supported anymore.")
-            }
-
-            // Work on a copy: `dev` is the instance the saved-device flow hands to the UI, and
-            // mutating it here used to overwrite the scale's identity (issue #1478).
-            // An unsupported device is handed over as such so the connector reports it to the user
-            // instead of the tap silently doing nothing.
-            val target = dev.copy(
-                isSupported = supported || developerMode,
-                determinedHandlerDisplayName = handlerName ?: dev.determinedHandlerDisplayName
-            )
-
-            connection.connectToDevice(target)
+            connectTo(dev)
         }
+    }
+
+    override suspend fun connectToSavedDeviceInBackground(): Boolean {
+        // savedDevice is shared WhileSubscribed and stays null without a UI collecting it.
+        val dev = settingsFacade.observeSavedDevice().first() ?: run {
+            LogManager.d(TAG, "Background connect: no saved device.")
+            return false
+        }
+        val user = withTimeoutOrNull(USER_LOAD_TIMEOUT_MS) {
+            userFacade.observeSelectedUser().filterNotNull().first()
+        } ?: run {
+            LogManager.w(TAG, "Background connect: no selected user.")
+            return false
+        }
+        currentAppUser.value = user
+        LogManager.i(TAG, "Background connect to ${dev.name} for user ${user.name}.")
+        connectTo(dev)
+        return true
+    }
+
+    private suspend fun connectTo(dev: ScannedDeviceInfo) {
+        val already = (connectionStatus.value == ConnectionStatus.CONNECTED ||
+                connectionStatus.value == ConnectionStatus.CONNECTING) &&
+                connectedDeviceAddress.value == dev.address
+        if (already) return
+
+        // Developer mode has to reach unsupported scales too – that is its whole point.
+        val developerMode = settingsFacade.developerModeEnabled.first()
+        val (supported, handlerName) = scaleFactory.getSupportingHandlerInfo(dev)
+        if (!supported && !developerMode) {
+            LogManager.w(TAG, "Saved device '${dev.name}' is not recognized as supported anymore.")
+        }
+
+        // Work on a copy: `dev` is the instance the saved-device flow hands to the UI, and
+        // mutating it here used to overwrite the scale's identity (issue #1478).
+        // An unsupported device is handed over as such so the connector reports it to the user
+        // instead of the tap silently doing nothing.
+        val target = dev.copy(
+            isSupported = supported || developerMode,
+            determinedHandlerDisplayName = handlerName ?: dev.determinedHandlerDisplayName
+        )
+
+        connection.connectToDevice(target)
     }
 
     override fun attemptAutoConnectToSavedDevice() = connectToSavedDevice()
@@ -278,6 +308,8 @@ class BluetoothFacadeImpl @Inject constructor(
         connection.close()
     }
 }
+
+private const val USER_LOAD_TIMEOUT_MS = 5_000L
 
 @Module
 @InstallIn(SingletonComponent::class)

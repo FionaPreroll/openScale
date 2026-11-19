@@ -700,6 +700,7 @@ class FakeBluetoothFacade @Inject constructor(private val scaleFactory: ScaleFac
     override fun stopScan() {}
     override fun connectToSavedDevice() {}
     override fun attemptAutoConnectToSavedDevice() {}
+    override suspend fun connectToSavedDeviceInBackground(): Boolean = false
     override fun disconnect() {}
     override fun saveAsPreferred(device: ScannedDeviceInfo) {}
     override fun removeSavedDevice() {}

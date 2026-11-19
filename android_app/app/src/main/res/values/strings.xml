@@ -418,6 +418,12 @@
     <string name="developer_section_title">Developer</string>
     <string name="danger_zone_title">Danger Zone</string>
     <string name="auto_connect_on_startup_title">Auto-connect on startup</string>
+    <string name="background_measurement_title">Measure in the background</string>
+    <string name="background_measurement_desc">Connects and saves the measurement when the scale wakes up, even when openScale is closed. To switch it on, step on the scale and confirm the system dialog.</string>
+    <string name="background_measurement_unsupported">Requires Android 13 or newer</string>
+    <string name="background_measurement_failed">Background measurement could not be set up: %1$s</string>
+    <string name="background_measurement_channel">Background measurement</string>
+    <string name="background_measurement_running">Measuring…</string>
     <!-- Scale Configuration (generic, shown when a handler declares config fields) -->
     <string name="scale_configuration_title">Scale Configuration</string>
     <string name="no_special_configuration_available">No additional special configuration available for this device.</string>

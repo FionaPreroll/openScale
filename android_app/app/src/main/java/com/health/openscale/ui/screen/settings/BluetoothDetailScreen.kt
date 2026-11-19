@@ -17,6 +17,10 @@
  */
 package com.health.openscale.ui.screen.settings
 
+import android.app.Activity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -37,6 +41,7 @@ import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -65,6 +70,7 @@ import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavController
 import com.health.openscale.R
@@ -88,6 +94,7 @@ fun BluetoothDetailScreen(
 ) {
     val scope = rememberCoroutineScope()
     val resources = LocalResources.current
+    val backgroundViewModel: BackgroundMeasurementViewModel = hiltViewModel()
 
     // --- Observe state from ViewModel ---
     val savedDevice by bluetoothViewModel.savedDevice.collectAsStateWithLifecycle()
@@ -205,6 +212,7 @@ fun BluetoothDetailScreen(
                 onCheckedChange = null,
             )
         }
+        BackgroundMeasurementRow(backgroundViewModel, sharedViewModel)
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
                 SettingsRow(
@@ -306,6 +314,7 @@ fun BluetoothDetailScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .clickable {
+                    backgroundViewModel.onSavedDeviceRemoved()
                     bluetoothViewModel.removeSavedDevice()
                     navController.popBackStack()
                 },
@@ -335,6 +344,40 @@ private fun SettingsSectionTitle(
     )
     HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
     Spacer(modifier = Modifier.height(8.dp))
+}
+
+/** Switch for measuring in the background when the saved scale wakes up (Android 13+). */
+@Composable
+private fun BackgroundMeasurementRow(vm: BackgroundMeasurementViewModel, sharedViewModel: SharedViewModel) {
+    val enabled by vm.enabled.collectAsStateWithLifecycle()
+    val busy by vm.busy.collectAsStateWithLifecycle()
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        vm.onConfirmationResult(result.resultCode == Activity.RESULT_OK)
+    }
+    LaunchedEffect(vm) {
+        vm.confirmation.collect { sender -> launcher.launch(IntentSenderRequest.Builder(sender).build()) }
+    }
+    LaunchedEffect(vm) {
+        vm.errors.collect { reason ->
+            sharedViewModel.showSnackbar(messageResId = R.string.background_measurement_failed, formatArgs = listOf(reason))
+        }
+    }
+    val canToggle = vm.isSupported && !busy
+    SettingsRow(
+        modifier    = Modifier.padding(horizontal = 16.dp),
+        label       = stringResource(R.string.background_measurement_title),
+        description = stringResource(
+            if (vm.isSupported) R.string.background_measurement_desc else R.string.background_measurement_unsupported
+        ),
+        icon        = Icons.Default.Sensors,
+        onClick     = if (canToggle) ({ vm.setEnabled(!enabled) }) else null
+    ) {
+        Switch(
+            checked         = enabled,
+            onCheckedChange = null,
+            enabled         = canToggle,
+        )
+    }
 }
 
 /**
