@@ -22,6 +22,8 @@ import com.health.openscale.core.data.MeasurementType
 import com.health.openscale.core.bluetooth.data.ScaleMeasurement
 import com.health.openscale.core.bluetooth.data.ScaleUser
 import com.health.openscale.core.bluetooth.libs.StandardImpedanceLib
+import com.health.openscale.core.data.EvaluationState
+import com.health.openscale.core.service.MeasurementEvaluator
 import com.health.openscale.core.service.ScannedDeviceInfo
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -55,11 +57,14 @@ import com.health.openscale.core.data.Percent
  *    whole-body impedance: `[00 00 00 00 00][z_hi][z_lo]` in Ω, or 0xFFFF if no impedance
  *    could be measured (shoes/socks, stepped off). The phone acks with `a5 05 26 11 00`;
  *    the scale still repeats a real impedance every 2.5 s until it gets results page 2.
- *  - The Vitafit app then sends its own body-composition results back for the scale's
- *    display (cmd 0x15, two pages). That payload is only partly decoded and is not sent here.
+ *  - The phone then sends the results for the scale's LCD (cmd 0x15, two pages of five 16-bit
+ *    slots: rating level in bits 13–15, value below). The LCD shows them verbatim (BF, BW, MM,
+ *    PR, BMI with an arrow-down / circle / arrow-up symbol per level); page 2 also ends the
+ *    impedance repeats. Without page 2 the LCD shows "Err".
  *
  * The scale itself sends only weight + impedance; body composition (fat/water/muscle) is left
- * to openScale's estimator, which needs the raw impedance published here.
+ * to openScale's estimator, which needs the raw impedance published here. openScale's results
+ * are sent back for the scale's display, rated with [MeasurementEvaluator] like in the app.
  *
  * One weigh-in is published at most once per connection, after which the link is closed. The
  * scale repeats its last final result when it is reconnected while still awake; such a replay
@@ -78,6 +83,8 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
     private var published = false
     private var warnedAttribute = false
     private var fallbackJob: Job? = null
+    private var awaitingResultsAck = false
+    private var resultsAckJob: Job? = null
 
     // --- kept across connections: ScaleFactory reuses one handler instance ---
     private var lastPublishedRaw = -1
@@ -106,6 +113,9 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         warnedAttribute = false
         fallbackJob?.cancel()
         fallbackJob = null
+        awaitingResultsAck = false
+        resultsAckJob?.cancel()
+        resultsAckJob = null
 
         setNotifyOn(service, notifyCharacteristic)
 
@@ -129,6 +139,7 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         when (data[3].toInt() and 0xFF) {
             CMD_WEIGHT -> decodeWeight(data)?.let { onWeight(it, user) }
             CMD_IMPEDANCE -> decodeImpedance(data)?.let { onImpedance(it.ohm, user) }
+            CMD_RESULTS -> onResultsAck(data)
             else -> logD("Vitafit: cmd 0x%02x data=%s".format(data[3].toInt() and 0xFF, data.toHexPreview(32)))
         }
     }
@@ -136,6 +147,9 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
     override fun onDisconnected() {
         fallbackJob?.cancel()
         fallbackJob = null
+        awaitingResultsAck = false
+        resultsAckJob?.cancel()
+        resultsAckJob = null
         // Link lost after a stable weight but before the impedance frame: keep the weight.
         if (!published && latchedWeightRaw >= 0) {
             logD("Vitafit: disconnected before impedance; publishing weight-only")
@@ -227,6 +241,11 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         lastPublishedAtMs = System.currentTimeMillis()
 
         val weightKg = weightRaw / 100.0f
+        val bmi = bmiOf(weightKg, user)
+        var display = DisplayValues(
+            bmi = bmi,
+            bmiLevel = bmi?.let { levelFor(MeasurementEvaluator.evalBmi(it, user.age, user.gender).state) } ?: 0,
+        )
         val measurement = ScaleMeasurement().apply {
             userId = user.id
             dateTime = Date(lastPublishedAtMs)
@@ -251,6 +270,15 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
                 measurement[MeasurementType.MUSCLE] = Percent(lib.skeletalMusclePercentage.toFloat())
                 measurement[MeasurementType.BONE] = Kg(lib.boneMassKg.toFloat())
                 measurement[MeasurementType.BMR] = Kcal(lib.basalMetabolicRate.toFloat())
+                val fat = lib.totalFatPercentage.toFloat()
+                display = display.copy(
+                    fatPercent = fat,
+                    fatLevel = levelFor(MeasurementEvaluator.evalBodyFat(fat, user.age, user.gender).state),
+                    waterPercent = lib.totalBodyWaterPercentage.toFloat(),
+                    musclePercent = lib.skeletalMusclePercentage.toFloat(),
+                    boneKg = lib.boneMassKg.toFloat(),
+                    bmrKcal = lib.basalMetabolicRate.toFloat(),
+                )
             } else {
                 logW("Vitafit: user height/age missing; storing impedance without body composition")
             }
@@ -258,7 +286,40 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
 
         publish(measurement)
         logI("Vitafit publish weight=$weightKg kg impedance=${impedanceOhm ?: "none"} Ω")
-        if (disconnect) requestDisconnect()
+        if (disconnect) showResultsAndDisconnect(display)
+    }
+
+    /**
+     * Sends the results pages for the scale's LCD, then disconnects once the scale has acked
+     * page 2. [requestDisconnect] cancels the link at once, so it must not run before the queued
+     * page writes went out.
+     */
+    private fun showResultsAndDisconnect(values: DisplayValues) {
+        buildResultPages(values).forEach { writeTo(service, writeCharacteristic, it) }
+        awaitingResultsAck = true
+        resultsAckJob?.cancel()
+        resultsAckJob = scope.launch {
+            delay(RESULTS_ACK_TIMEOUT_MS)
+            if (awaitingResultsAck) {
+                logD("Vitafit: results page 2 not acked within ${RESULTS_ACK_TIMEOUT_MS} ms; disconnecting")
+                finishSession()
+            }
+        }
+    }
+
+    private fun onResultsAck(frame: ByteArray) {
+        if (frame.size != 7) return
+        val page = frame[4].toInt() and 0xFF
+        logD("Vitafit: scale acked results page $page")
+        if (awaitingResultsAck && page == 2) finishSession()
+    }
+
+    private fun finishSession() {
+        awaitingResultsAck = false
+        val job = resultsAckJob
+        resultsAckJob = null
+        requestDisconnect()
+        job?.cancel()
     }
 
     /** A decoded cmd 0x10 frame. */
@@ -266,6 +327,21 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
 
     /** A decoded cmd 0x11 frame; [ohm] is `null` when the scale could not measure an impedance. */
     data class ImpedanceReading(val ohm: Int?)
+
+    /**
+     * Values for the scale's LCD. `null` = not available (the LCD shows "--"); levels are
+     * 0 = none, 1 = low, 2 = normal, 3 = high, 4 = very high.
+     */
+    data class DisplayValues(
+        val fatPercent: Float? = null,
+        val fatLevel: Int = 0,
+        val waterPercent: Float? = null,
+        val musclePercent: Float? = null,
+        val boneKg: Float? = null,
+        val bmi: Float? = null,
+        val bmiLevel: Int = 0,
+        val bmrKcal: Float? = null,
+    )
 
     companion object {
         private const val HEADER_SCALE = 0x5A
@@ -275,6 +351,7 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
 
         private const val CMD_WEIGHT = 0x10
         private const val CMD_IMPEDANCE = 0x11
+        private const val CMD_RESULTS = 0x15
         private const val CMD_SET_UNIT = 0x17
         private const val CMD_HELLO = 0x33
         private const val CMD_QUERY = 0x44
@@ -291,6 +368,63 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         /** Impedance value the scale sends when it could not measure one. */
         const val IMPEDANCE_NONE = 0xFFFF
         private const val MAX_PLAUSIBLE_IMPEDANCE = 1500
+
+        /** The scale acks each results page within ~40 ms. */
+        const val RESULTS_ACK_TIMEOUT_MS = 3000L
+
+        /** Value bits of a results slot; body fat only has bits 0–9 (bits 10–11 unknown). */
+        private const val SLOT_VALUE_MASK = 0x1FFF
+        private const val BODY_FAT_VALUE_MASK = 0x3FF
+
+        /** Maps openScale's evaluation to the scale's rating level (LCD symbol). */
+        fun levelFor(state: EvaluationState): Int = when (state) {
+            EvaluationState.LOW -> 1        // arrow down
+            EvaluationState.NORMAL -> 2     // blue circle
+            EvaluationState.HIGH -> 3       // arrow up
+            EvaluationState.UNDEFINED -> 0
+        }
+
+        /** BMI from the profile height, or `null` without a height. */
+        fun bmiOf(weightKg: Float, user: ScaleUser): Float? {
+            val h = user.bodyHeight / 100f
+            return if (h > 0f) weightKg / (h * h) else null
+        }
+
+        /**
+         * The two cmd 0x15 frames for the LCD. Slots that openScale does not compute (protein,
+         * subcutaneous fat, visceral fat, metabolic age) are sent as 0 ("--"). The muscle screen
+         * shows openScale's MUSCLE value (skeletal muscle %).
+         *
+         * Page 1: body fat % ×10, water % ×10, muscle % ×10, bone kg ×100, BMI ×10.
+         * Page 2: protein, skeletal muscle % ×10, subcutaneous fat, BMR kcal, visceral fat/metabolic age.
+         */
+        fun buildResultPages(v: DisplayValues): List<ByteArray> {
+            val page1 = intArrayOf(
+                slot(v.fatPercent, 10, v.fatLevel, BODY_FAT_VALUE_MASK),
+                slot(v.waterPercent, 10),
+                slot(v.musclePercent, 10),
+                slot(v.boneKg, 100),
+                slot(v.bmi, 10, v.bmiLevel),
+            )
+            val page2 = intArrayOf(0, slot(v.musclePercent, 10), 0, slot(v.bmrKcal, 1), 0)
+            return listOf(resultsPage(1, page1), resultsPage(2, page2))
+        }
+
+        private fun slot(value: Float?, scale: Int, level: Int = 0, mask: Int = SLOT_VALUE_MASK): Int {
+            if (value == null || !value.isFinite() || value <= 0f) return 0
+            val raw = Math.round(value * scale).coerceIn(0, mask)
+            return (level.coerceIn(0, 7) shl 13) or raw
+        }
+
+        private fun resultsPage(page: Int, words: IntArray): ByteArray {
+            val data = ByteArray(11)
+            data[0] = page.toByte()
+            words.forEachIndexed { i, w ->
+                data[1 + 2 * i] = (w shr 8).toByte()
+                data[2 + 2 * i] = w.toByte()
+            }
+            return buildCommand(CMD_RESULTS, data)
+        }
 
         /** Observed gap from the last stable/final frame to the impedance frame is ~2.3 s. */
         const val IMPEDANCE_TIMEOUT_MS = 5000L

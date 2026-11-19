@@ -20,6 +20,7 @@ package com.health.openscale.core.bluetooth.scales
 import com.google.common.truth.Truth.assertThat
 import com.health.openscale.core.bluetooth.data.ScaleMeasurement
 import com.health.openscale.core.bluetooth.data.ScaleUser
+import com.health.openscale.core.data.EvaluationState
 import com.health.openscale.core.data.GenderType
 import com.health.openscale.core.data.Kg
 import com.health.openscale.core.data.MeasurementType
@@ -179,6 +180,13 @@ class VitafitVT701HandlerTest {
         assertThat(m[MeasurementType.IMPEDANCE]!!.value).isWithin(1e-3f).of(484f)
         assertThat(m[MeasurementType.BODY_FAT]).isNotNull()
         assertThat(m[MeasurementType.WATER]).isNotNull()
+        // The results pages for the LCD go out first; the link closes once page 2 is acked.
+        assertThat(s.writes.takeLast(2).map { it.second.take(10) })
+            .containsExactly("a50f261501", "a50f261502").inOrder()
+        assertThat(s.disconnects).isEqualTo(0)
+        s.notify("5a 05 26 15 01 37 aa")
+        assertThat(s.disconnects).isEqualTo(0)
+        s.notify("5a 05 26 15 02 34 aa")
         assertThat(s.disconnects).isEqualTo(1)
     }
 
@@ -191,12 +199,14 @@ class VitafitVT701HandlerTest {
 
         assertThat(s.notifyEnabled).containsExactly(uuid16(0xFFF1))
         assertThat(s.writes.map { it.first }.toSet()).containsExactly(uuid16(0xFFF2))
-        assertThat(s.writes.map { it.second }).containsExactly(
+        assertThat(s.writes.map { it.second }.take(9)).containsExactly(
             "a50526330010aa", "a504264466aa", "a50526170135aa",   // hello, query, unit
             "a50526100033aa", "a50526100132aa", "a50526100132aa", "a50526100132aa", // phase acks
             "a50526100231aa",
             "a50526110032aa",                                       // impedance ack
         ).inOrder()
+        assertThat(s.writes.drop(9).map { it.second.take(10) })    // results pages for the LCD
+            .containsExactly("a50f261501", "a50f261502").inOrder()
     }
 
     @Test
@@ -243,6 +253,7 @@ class VitafitVT701HandlerTest {
         val m = s.published.single()
         assertThat(m[MeasurementType.WEIGHT]!!.value).isWithin(1e-3f).of(80.30f)
         assertThat(m[MeasurementType.IMPEDANCE]!!.value).isWithin(1e-3f).of(525f)
+        s.notify("5a 05 26 15 02 34 aa")
         assertThat(s.disconnects).isEqualTo(1)
     }
 
@@ -311,6 +322,7 @@ class VitafitVT701HandlerTest {
 
         assertThat(s.published).hasSize(1)
         assertThat(s.disconnects).isEqualTo(0)
+        assertThat(s.writes.none { it.second.startsWith("a50f2615") }).isTrue()   // no pages
     }
 
     @Test
@@ -334,6 +346,64 @@ class VitafitVT701HandlerTest {
         )
         assertThat(support).isNotNull()
         assertThat(support!!.displayName).isEqualTo("Vitafit VT701 / VT715")
+    }
+
+    // --- results pages for the LCD -------------------------------------------------------------
+
+    @Test
+    fun `builds the results pages with values and rating levels`() {
+        val pages = VitafitVT701Handler.buildResultPages(
+            VitafitVT701Handler.DisplayValues(
+                fatPercent = 31.1f, fatLevel = 3, waterPercent = 49.6f, musclePercent = 35.3f,
+                boneKg = 3.46f, bmi = 30.5f, bmiLevel = 3, bmrKcal = 1682f,
+            )
+        )
+        // Page 1: fat 0x6137 (level 3, 311), water 496, muscle 353, bone 346, BMI 0x6131.
+        assertThat(pages[0]).isEqualTo(hex("a5 0f 26 15 01 61 37 01 f0 01 61 01 5a 61 31 f1 aa"))
+        // Page 2: protein --, skeletal muscle 353, subcutaneous fat --, BMR 1682, VF/age --.
+        assertThat(pages[1]).isEqualTo(hex("a5 0f 26 15 02 00 00 01 61 00 00 06 92 00 00 ca aa"))
+    }
+
+    @Test
+    fun `sends only the BMI when there is no impedance`() {
+        val pages = VitafitVT701Handler.buildResultPages(
+            VitafitVT701Handler.DisplayValues(bmi = 27.2f, bmiLevel = 3)
+        )
+        assertThat(pages[0]).isEqualTo(hex("a5 0f 26 15 01 00 00 00 00 00 00 00 00 61 10 4c aa"))
+        // An all-zero page 2 still completes the result (the LCD shows "--" instead of "Err").
+        assertThat(pages[1]).isEqualTo(hex("a5 0f 26 15 02 00 00 00 00 00 00 00 00 00 00 3e aa"))
+    }
+
+    @Test
+    fun `maps openScale's evaluation to the LCD symbol`() {
+        assertThat(VitafitVT701Handler.levelFor(EvaluationState.LOW)).isEqualTo(1)       // arrow down
+        assertThat(VitafitVT701Handler.levelFor(EvaluationState.NORMAL)).isEqualTo(2)    // circle
+        assertThat(VitafitVT701Handler.levelFor(EvaluationState.HIGH)).isEqualTo(3)      // arrow up
+        assertThat(VitafitVT701Handler.levelFor(EvaluationState.UNDEFINED)).isEqualTo(0)
+    }
+
+    @Test
+    fun `rates body fat and BMI like the app and leaves the rest unrated`() {
+        // Male, 35 years, 180 cm, 88.20 kg, 484 Ohm: BMI 27.2 and body fat ~26 % are both high.
+        val s = Setup(user(heightCm = 180f, age = 35))
+        s.connect()
+        liveWeighInWithImpedance.forEach { s.notify(it) }
+
+        val page1 = s.writes.first { it.second.startsWith("a50f261501") }.second
+        val words = (0 until 5).map { page1.substring(10 + 4 * it, 14 + 4 * it).toInt(16) }
+        assertThat(words.map { it shr 13 }).containsExactly(3, 0, 0, 0, 3).inOrder()
+        assertThat((words[4] and 0x1FFF) / 10f).isWithin(0.051f).of(88.20f / (1.8f * 1.8f))
+    }
+
+    @Test
+    fun `disconnects after a timeout when the scale does not ack page 2`() {
+        val s = Setup(user())
+        s.connect()
+        liveWeighInWithImpedance.forEach { s.notify(it) }
+        assertThat(s.disconnects).isEqualTo(0)
+
+        s.advanceBy(VitafitVT701Handler.RESULTS_ACK_TIMEOUT_MS + 100)
+        assertThat(s.disconnects).isEqualTo(1)
     }
 
     // --- harness ---------------------------------------------------------------------------------
