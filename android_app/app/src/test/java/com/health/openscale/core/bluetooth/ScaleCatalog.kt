@@ -279,6 +279,8 @@ object ScaleCatalog {
         device("relaxmedic") claimedBy RelaxmedicHandler::class.java,
         device("robi") claimedBy RobiS9Handler::class.java,
         device("Vitafit VT701") claimedBy VitafitVT701Handler::class.java,
+        // VT715 (and VT701 units) advertise as "Vitafit Body Fat".
+        device("Vitafit Body Fat") claimedBy VitafitVT701Handler::class.java,
         device("EEBBL") claimedBy EEBBLHandler::class.java,
         device("FITTRACK Dara") claimedBy FitTrackDaraHandler::class.java,
         device("SSW532", SERVICE_FFB0) claimedBy DrTrustSSW532Handler::class.java,

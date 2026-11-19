@@ -28,27 +28,41 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Date
 import java.util.UUID
+import kotlin.math.abs
 import com.health.openscale.core.data.Kcal
 import com.health.openscale.core.data.Kg
 import com.health.openscale.core.data.Ohm
 import com.health.openscale.core.data.Percent
 
 /**
- * Vitafit "Body Fat" smart scale (VT701), sold with the Vitafit / Fitdays app.
+ * Vitafit "Body Fat" smart scales (VT701, VT715), sold with the Vitafit / Fitdays app.
  *
- * Protocol reverse-engineered from an HCI snoop of two Vitafit-app weigh-ins and confirmed
- * against the scale's displayed readings (85.00 kg and 84.95 kg):
+ * Both models advertise as "Vitafit Body Fat" (manufacturer string "SHINE") and speak the same
+ * protocol. It was reverse-engineered from HCI snoops of Vitafit-app weigh-ins (VT701: 85.00 /
+ * 84.95 kg; VT715: four sessions with 86.75–88.20 kg, see the VT715 protocol notes in
+ * github.com/FionaPreroll/Vitafit-VT715-ReverseEngineering, PROTOCOL.md):
  *  - Service 0xFFF0, notify characteristic 0xFFF1, write characteristic 0xFFF2.
- *  - Both directions use the frame `[hdr][len][0x26][type][data…][chk][0xAA]`, where
+ *  - Both directions use the frame `[hdr][len][0x26][cmd][data…][chk][0xAA]`, where
  *    `hdr` = 0x5A for scale→phone and 0xA5 for phone→scale, `len` counts every byte after
  *    itself (0x26 through 0xAA), and `chk` = XOR of `len` through the last data byte.
- *  - Type 0x10 frames stream live weight; byte 4 is a stability flag that settles to 0x02, and
- *    the weight is a 16-bit big-endian value in 0.01 kg at bytes 8..9.
- *  - After the phone acks the stable weight (`a5 05 26 10 02 …`) the scale reports the raw
- *    whole-body impedance in a type 0x11 frame (16-bit big-endian Ω at bytes 9..10, ~390 Ω).
+ *  - On connect the app sends 0x33 (hello), 0x44 (query) and 0x17 01 (presumably "unit = kg").
+ *  - Cmd 0x10 streams the weight: `[phase][00][00][attr][w_hi][w_lo]`, weight in 0.01 kg.
+ *    `phase` is 0 = idle/zero, 1 = measuring, 2 = stable (impedance is being measured),
+ *    3 = final. The phone acks every frame with `a5 05 26 10 [phase]`; a final frame is
+ *    repeated until it is acked, so a weigh-in finished before the phone connected still
+ *    arrives (as phase 3 only). `attr` was 0x21 in every capture (2 decimals, kg).
+ *  - About 2.3 s after the last stable/final frame the scale sends cmd 0x11 with the raw
+ *    whole-body impedance: `[00 00 00 00 00][z_hi][z_lo]` in Ω, or 0xFFFF if no impedance
+ *    could be measured (shoes/socks, stepped off). The phone acks with `a5 05 26 11 00`.
+ *  - The Vitafit app then sends its own body-composition results back for the scale's
+ *    display (cmd 0x15, two pages). That payload is only partly decoded and is not sent here.
  *
  * The scale itself sends only weight + impedance; body composition (fat/water/muscle) is left
  * to openScale's estimator, which needs the raw impedance published here.
+ *
+ * One weigh-in is published at most once per connection, after which the link is closed. The
+ * scale repeats its last final result when it is reconnected while still awake; such a replay
+ * of the measurement that was just stored is recognised and dropped.
  */
 class VitafitVT701Handler : ScaleDeviceHandler() {
 
@@ -56,9 +70,17 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
     private val notifyCharacteristic = uuid16(0xFFF1)
     private val writeCharacteristic = uuid16(0xFFF2)
 
-    private var savedWeightKg = -1f
+    // --- per-connection state (reset in onConnected) ---
+    private var latchedWeightRaw = -1
+    private var sawLiveFrames = false
+    private var ignoringReplay = false
     private var published = false
+    private var warnedAttribute = false
     private var fallbackJob: Job? = null
+
+    // --- kept across connections: ScaleFactory reuses one handler instance ---
+    private var lastPublishedRaw = -1
+    private var lastPublishedAtMs = 0L
 
     override fun supportFor(device: ScannedDeviceInfo): DeviceSupport? {
         if (!device.name.startsWith("Vitafit", ignoreCase = true)) return null
@@ -68,7 +90,7 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
             DeviceCapability.BODY_COMPOSITION
         )
         return DeviceSupport(
-            displayName = "Vitafit VT701",
+            displayName = "Vitafit VT701 / VT715",
             capabilities = caps,
             implemented = caps,
             linkMode = LinkMode.CONNECT_GATT
@@ -76,8 +98,11 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
     }
 
     override fun onConnected(user: ScaleUser) {
-        savedWeightKg = -1f
+        latchedWeightRaw = -1
+        sawLiveFrames = false
+        ignoringReplay = false
         published = false
+        warnedAttribute = false
         fallbackJob?.cancel()
         fallbackJob = null
 
@@ -85,118 +110,247 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
 
         // Replay the app's static hello sequence. These frames carry no timestamp/user data,
         // so they are safe to send verbatim; the scale then streams type 0x10 weight frames.
-        writeTo(service, writeCharacteristic, buildCommand(0x33, byteArrayOf(0x00)))
-        writeTo(service, writeCharacteristic, buildCommand(0x44, byteArrayOf()))
-        writeTo(service, writeCharacteristic, buildCommand(0x17, byteArrayOf(0x01)))
+        writeTo(service, writeCharacteristic, buildCommand(CMD_HELLO, byteArrayOf(0x00)))
+        writeTo(service, writeCharacteristic, buildCommand(CMD_QUERY, byteArrayOf()))
+        writeTo(service, writeCharacteristic, buildCommand(CMD_SET_UNIT, byteArrayOf(UNIT_KG.toByte())))
 
         userInfo(R.string.bt_info_step_on_scale)
     }
 
     override fun onNotification(characteristic: UUID, data: ByteArray, user: ScaleUser) {
         if (characteristic != notifyCharacteristic) return
-        if (published) return
 
-        parseStableWeightRaw(data)?.let { raw ->
-            if (savedWeightKg >= 0f) return  // already latched; wait for impedance
-            savedWeightKg = raw / 100.0f
-            logD("Vitafit stable weight=$savedWeightKg kg")
-
-            // Ack the stable weight; this prompts the scale to run the impedance measurement.
-            writeTo(service, writeCharacteristic, buildCommand(TYPE_WEIGHT, byteArrayOf(STABLE_FLAG.toByte())))
-
-            // Safety net: if the impedance frame never arrives (e.g. user steps off), publish
-            // weight-only so the reading is not lost.
-            fallbackJob = scope.launch {
-                delay(6000)
-                if (!published && savedWeightKg >= 0f) {
-                    logD("No impedance within 6s; publishing weight-only")
-                    publishMeasurement(savedWeightKg, 0, user)
-                }
-            }
+        if (!isValidScaleFrame(data)) {
+            // The first notification after connecting is sometimes a stale, truncated frame.
+            logD("Vitafit: dropping invalid frame ${data.toHexPreview(32)}")
             return
         }
-
-        parseImpedanceOhm(data)?.let { ohm ->
-            if (savedWeightKg < 0f) return  // impedance without a weight — ignore
-            // Ack the impedance frame like the app does.
-            writeTo(service, writeCharacteristic, buildCommand(TYPE_IMPEDANCE, byteArrayOf(0x00)))
-            publishMeasurement(savedWeightKg, ohm, user)
+        when (data[3].toInt() and 0xFF) {
+            CMD_WEIGHT -> decodeWeight(data)?.let { onWeight(it, user) }
+            CMD_IMPEDANCE -> decodeImpedance(data)?.let { onImpedance(it.ohm, user) }
+            else -> logD("Vitafit: cmd 0x%02x data=%s".format(data[3].toInt() and 0xFF, data.toHexPreview(32)))
         }
     }
 
-    private fun publishMeasurement(weightKg: Float, impedanceOhm: Int, user: ScaleUser) {
+    override fun onDisconnected() {
+        fallbackJob?.cancel()
+        fallbackJob = null
+        // Link lost after a stable weight but before the impedance frame: keep the weight.
+        if (!published && latchedWeightRaw >= 0) {
+            logD("Vitafit: disconnected before impedance; publishing weight-only")
+            publishMeasurement(latchedWeightRaw, null, currentAppUser(), disconnect = false)
+        }
+    }
+
+    private fun onWeight(reading: WeightReading, user: ScaleUser) {
+        if (published) return
+
+        // Ack every weight frame with its phase like the Vitafit app; the scale keeps repeating a
+        // final (phase 3) frame until it is acked and only then moves on to the impedance frame.
+        writeTo(service, writeCharacteristic, buildCommand(CMD_WEIGHT, byteArrayOf(reading.phase.toByte())))
+
+        if (reading.attribute != ATTR_KG_2_DECIMALS && !warnedAttribute) {
+            warnedAttribute = true
+            logW("Vitafit: unknown weight attribute 0x%02x, decoding as 0.01 kg".format(reading.attribute))
+        }
+
+        when (reading.phase) {
+            PHASE_IDLE, PHASE_MEASURING -> {
+                // A new weigh-in is under way; a replayed old result no longer applies.
+                sawLiveFrames = true
+                ignoringReplay = false
+            }
+            PHASE_STABLE, PHASE_FINAL -> {
+                if (ignoringReplay) return
+                if (reading.phase == PHASE_FINAL && !sawLiveFrames && latchedWeightRaw < 0 &&
+                    isReplay(reading.weightRaw, System.currentTimeMillis(), user)
+                ) {
+                    logI("Vitafit: final ${reading.weightRaw / 100.0f} kg repeats the stored measurement; ignoring")
+                    ignoringReplay = true
+                    return
+                }
+                if (reading.phase == PHASE_STABLE) sawLiveFrames = true
+                if (latchedWeightRaw != reading.weightRaw) {
+                    logD("Vitafit: weight=${reading.weightRaw / 100.0f} kg (phase ${reading.phase})")
+                }
+                latchedWeightRaw = reading.weightRaw
+                restartFallback(user)
+            }
+            else -> logD("Vitafit: unknown weight phase ${reading.phase}")
+        }
+    }
+
+    private fun onImpedance(ohm: Int?, user: ScaleUser) {
+        if (published) return
+        writeTo(service, writeCharacteristic, buildCommand(CMD_IMPEDANCE, byteArrayOf(0x00)))
+        // Impedance without a latched weight belongs to an ignored replay or a lost weigh-in.
+        if (latchedWeightRaw < 0) return
+        publishMeasurement(latchedWeightRaw, ohm, user)
+    }
+
+    /**
+     * Safety net: if the impedance frame never arrives, publish weight-only. Restarted with every
+     * stable/final frame, because the scale keeps measuring while it repeats them.
+     */
+    private fun restartFallback(user: ScaleUser) {
+        fallbackJob?.cancel()
+        fallbackJob = scope.launch {
+            delay(IMPEDANCE_TIMEOUT_MS)
+            if (!published && latchedWeightRaw >= 0) {
+                logD("Vitafit: no impedance within ${IMPEDANCE_TIMEOUT_MS} ms; publishing weight-only")
+                publishMeasurement(latchedWeightRaw, null, user)
+            }
+        }
+    }
+
+    private fun isReplay(weightRaw: Int, nowMs: Long, user: ScaleUser): Boolean {
+        if (isSameWeighIn(weightRaw, nowMs, lastPublishedRaw, lastPublishedAtMs)) return true
+        // Also catches a replay after openScale was restarted between the two connections.
+        val last = lastMeasurementFor(user.id) ?: return false
+        val lastKg = last[MeasurementType.WEIGHT]?.value ?: return false
+        val lastAt = last.dateTime?.time ?: return false
+        return isSameWeighIn(weightRaw, nowMs, Math.round(lastKg * 100f), lastAt)
+    }
+
+    private fun publishMeasurement(
+        weightRaw: Int,
+        impedanceOhm: Int?,
+        user: ScaleUser,
+        disconnect: Boolean = true,
+    ) {
         if (published) return
         published = true
         fallbackJob?.cancel()
         fallbackJob = null
+        lastPublishedRaw = weightRaw
+        lastPublishedAtMs = System.currentTimeMillis()
 
+        val weightKg = weightRaw / 100.0f
         val measurement = ScaleMeasurement().apply {
             userId = user.id
-            dateTime = Date()
+            dateTime = Date(lastPublishedAtMs)
             this[MeasurementType.WEIGHT] = Kg(weightKg)
         }
 
         // The scale reports only weight + raw impedance; derive body composition the same way the
         // other impedance scales in this package do. The guard mirrors StandardImpedanceLib's note
         // that its formulas only hold for whole-body impedance in a sane range.
-        if (impedanceOhm in 1 until 1500) {
+        if (impedanceOhm != null && impedanceOhm in 1 until MAX_PLAUSIBLE_IMPEDANCE) {
             measurement[MeasurementType.IMPEDANCE] = Ohm(impedanceOhm.toFloat())
-            val lib = StandardImpedanceLib(
-                gender = user.gender,
-                age = user.age,
-                weightKg = weightKg.toDouble(),
-                heightM = user.bodyHeight / 100.0,
-                impedance = impedanceOhm.toDouble(),
-            )
-            measurement[MeasurementType.BODY_FAT] = Percent(lib.totalFatPercentage.toFloat())
-            measurement[MeasurementType.WATER] = Percent(lib.totalBodyWaterPercentage.toFloat())
-            measurement[MeasurementType.MUSCLE] = Percent(lib.skeletalMusclePercentage.toFloat())
-            measurement[MeasurementType.BONE] = Kg(lib.boneMassKg.toFloat())
-            measurement[MeasurementType.BMR] = Kcal(lib.basalMetabolicRate.toFloat())
+            if (user.bodyHeight > 0f && user.age > 0) {
+                val lib = StandardImpedanceLib(
+                    gender = user.gender,
+                    age = user.age,
+                    weightKg = weightKg.toDouble(),
+                    heightM = user.bodyHeight / 100.0,
+                    impedance = impedanceOhm.toDouble(),
+                )
+                measurement[MeasurementType.BODY_FAT] = Percent(lib.totalFatPercentage.toFloat())
+                measurement[MeasurementType.WATER] = Percent(lib.totalBodyWaterPercentage.toFloat())
+                measurement[MeasurementType.MUSCLE] = Percent(lib.skeletalMusclePercentage.toFloat())
+                measurement[MeasurementType.BONE] = Kg(lib.boneMassKg.toFloat())
+                measurement[MeasurementType.BMR] = Kcal(lib.basalMetabolicRate.toFloat())
+            } else {
+                logW("Vitafit: user height/age missing; storing impedance without body composition")
+            }
         }
 
         publish(measurement)
-        logI("Vitafit publish weight=$weightKg kg impedance=$impedanceOhm Ω")
-        requestDisconnect()
+        logI("Vitafit publish weight=$weightKg kg impedance=${impedanceOhm ?: "none"} Ω")
+        if (disconnect) requestDisconnect()
     }
+
+    /** A decoded cmd 0x10 frame. */
+    data class WeightReading(val phase: Int, val attribute: Int, val weightRaw: Int)
+
+    /** A decoded cmd 0x11 frame; [ohm] is `null` when the scale could not measure an impedance. */
+    data class ImpedanceReading(val ohm: Int?)
 
     companion object {
         private const val HEADER_SCALE = 0x5A
         private const val HEADER_PHONE = 0xA5
         private const val PRODUCT_ID = 0x26
         private const val TRAILER = 0xAA
-        private const val TYPE_WEIGHT = 0x10
-        private const val TYPE_IMPEDANCE = 0x11
-        private const val STABLE_FLAG = 0x02
+
+        private const val CMD_WEIGHT = 0x10
+        private const val CMD_IMPEDANCE = 0x11
+        private const val CMD_SET_UNIT = 0x17
+        private const val CMD_HELLO = 0x33
+        private const val CMD_QUERY = 0x44
+        private const val UNIT_KG = 0x01
+
+        const val PHASE_IDLE = 0x00
+        const val PHASE_MEASURING = 0x01
+        const val PHASE_STABLE = 0x02
+        const val PHASE_FINAL = 0x03
+
+        /** Weight attribute seen in every capture: high nibble = 2 decimals, low nibble = kg. */
+        private const val ATTR_KG_2_DECIMALS = 0x21
+
+        /** Impedance value the scale sends when it could not measure one. */
+        const val IMPEDANCE_NONE = 0xFFFF
+        private const val MAX_PLAUSIBLE_IMPEDANCE = 1500
+
+        /** Observed gap from the last stable/final frame to the impedance frame is ~2.3 s. */
+        const val IMPEDANCE_TIMEOUT_MS = 5000L
+
+        /** A final frame equal to a measurement stored this recently is a replay. */
+        const val REPLAY_WINDOW_MS = 5 * 60 * 1000L
 
         /**
-         * Weight in raw 0.01 kg units from a valid, *stable* type 0x10 frame, or `null` if the
-         * frame is malformed, not a weight frame, or still settling.
+         * Weight in raw 0.01 kg units from a valid type 0x10 frame whose phase is stable (0x02) or
+         * final (0x03), or `null` if the frame is malformed, not a weight frame, or still settling.
          *
-         * Layout: `5a 0a 26 10 [flag] 00 00 [w_hi_extra] [w_hi] [w_lo] [chk] aa`; the weight is
+         * Layout: `5a 0a 26 10 [phase] 00 00 [attr] [w_hi] [w_lo] [chk] aa`; the weight is
          * the big-endian pair at bytes 8..9 (e.g. `21 34` = 8500 = 85.00 kg).
          */
         fun parseStableWeightRaw(frame: ByteArray): Int? {
+            val reading = decodeWeight(frame) ?: return null
+            return if (reading.phase == PHASE_STABLE || reading.phase == PHASE_FINAL) reading.weightRaw else null
+        }
+
+        /** Decodes any valid type 0x10 frame, whatever its phase. */
+        fun decodeWeight(frame: ByteArray): WeightReading? {
             if (!isValidScaleFrame(frame)) return null
-            if ((frame[3].toInt() and 0xFF) != TYPE_WEIGHT) return null
-            if (frame.size < 12) return null
-            if ((frame[4].toInt() and 0xFF) != STABLE_FLAG) return null
-            return ((frame[8].toInt() and 0xFF) shl 8) or (frame[9].toInt() and 0xFF)
+            if ((frame[3].toInt() and 0xFF) != CMD_WEIGHT) return null
+            if (frame.size != 12) return null
+            return WeightReading(
+                phase = frame[4].toInt() and 0xFF,
+                attribute = frame[7].toInt() and 0xFF,
+                weightRaw = ((frame[8].toInt() and 0xFF) shl 8) or (frame[9].toInt() and 0xFF),
+            )
         }
 
         /**
-         * Whole-body impedance in ohms from a valid type 0x11 frame, or `null` if the frame is
-         * malformed, not an impedance frame, or reports zero.
+         * Decodes a valid type 0x11 frame, or returns `null` if the frame is malformed or not an
+         * impedance frame. [ImpedanceReading.ohm] is `null` when the scale reports that it could
+         * not measure an impedance (0xFFFF, or 0).
          *
          * Layout: `5a 0b 26 11 00 00 00 00 00 [z_hi] [z_lo] [chk] aa`; impedance is the big-endian
          * pair at bytes 9..10 (e.g. `01 89` = 393 Ω).
          */
-        fun parseImpedanceOhm(frame: ByteArray): Int? {
+        fun decodeImpedance(frame: ByteArray): ImpedanceReading? {
             if (!isValidScaleFrame(frame)) return null
-            if ((frame[3].toInt() and 0xFF) != TYPE_IMPEDANCE) return null
-            if (frame.size < 13) return null
+            if ((frame[3].toInt() and 0xFF) != CMD_IMPEDANCE) return null
+            if (frame.size != 13) return null
             val ohm = ((frame[9].toInt() and 0xFF) shl 8) or (frame[10].toInt() and 0xFF)
-            return if (ohm > 0) ohm else null
+            return ImpedanceReading(if (ohm == 0 || ohm == IMPEDANCE_NONE) null else ohm)
+        }
+
+        /**
+         * Whole-body impedance in ohms from a valid type 0x11 frame, or `null` if the frame is
+         * malformed, not an impedance frame, or reports no impedance (0 or 0xFFFF).
+         */
+        fun parseImpedanceOhm(frame: ByteArray): Int? = decodeImpedance(frame)?.ohm
+
+        /**
+         * True if a final frame with [weightRaw] at [nowMs] repeats a weigh-in that was stored as
+         * [lastRaw] at [lastAtMs].
+         */
+        fun isSameWeighIn(weightRaw: Int, nowMs: Long, lastRaw: Int, lastAtMs: Long): Boolean {
+            if (lastRaw < 0) return false
+            val age = nowMs - lastAtMs
+            return abs(weightRaw - lastRaw) <= 1 && age in 0..REPLAY_WINDOW_MS
         }
 
         /** True if [frame] is a well-formed scale frame with a matching XOR checksum. */
