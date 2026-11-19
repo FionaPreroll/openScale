@@ -142,12 +142,13 @@ class VitafitVT701HandlerTest {
     }
 
     @Test
-    fun `treats an equal weight within five minutes as the same weigh-in`() {
+    fun `treats an equal weight within a minute as the same weigh-in`() {
         val t0 = 1_000_000L
-        assertThat(VitafitVT701Handler.isSameWeighIn(8685, t0 + 60_000, 8685, t0)).isTrue()
-        assertThat(VitafitVT701Handler.isSameWeighIn(8686, t0 + 60_000, 8685, t0)).isTrue()
-        assertThat(VitafitVT701Handler.isSameWeighIn(8675, t0 + 60_000, 8685, t0)).isFalse()
-        assertThat(VitafitVT701Handler.isSameWeighIn(8685, t0 + 6 * 60_000, 8685, t0)).isFalse()
+        assertThat(VitafitVT701Handler.isSameWeighIn(8685, t0 + 30_000, 8685, t0)).isTrue()
+        assertThat(VitafitVT701Handler.isSameWeighIn(8686, t0 + 30_000, 8685, t0)).isTrue()
+        assertThat(VitafitVT701Handler.isSameWeighIn(8675, t0 + 30_000, 8685, t0)).isFalse()
+        // 2026-11-19: 80.30 kg was weighed five times within four minutes; those are real.
+        assertThat(VitafitVT701Handler.isSameWeighIn(8030, t0 + 2 * 60_000, 8030, t0)).isFalse()
         assertThat(VitafitVT701Handler.isSameWeighIn(8685, t0, -1, 0L)).isFalse()
     }
 
@@ -230,6 +231,22 @@ class VitafitVT701HandlerTest {
     }
 
     @Test
+    fun `publishes a weigh-in whose connection starts in the stable phase`() {
+        // VT715 via scale_lab on macOS, 2026-11-19 09:33: connected while standing still, so the
+        // first frames are stable; the impedance frame then repeats every 2.5 s.
+        val s = Setup(user(heightCm = 180f, age = 40))
+        s.connect()
+        repeat(4) { s.notify("5a 0a 26 10 02 00 00 21 1f 5e 5e aa") }   // 80.30 kg
+        repeat(2) { s.notify("5a 0b 26 11 00 00 00 00 00 02 0d 33 aa") } // 525 Ohm
+
+        assertThat(s.published).hasSize(1)
+        val m = s.published.single()
+        assertThat(m[MeasurementType.WEIGHT]!!.value).isWithin(1e-3f).of(80.30f)
+        assertThat(m[MeasurementType.IMPEDANCE]!!.value).isWithin(1e-3f).of(525f)
+        assertThat(s.disconnects).isEqualTo(1)
+    }
+
+    @Test
     fun `drops the final result the scale repeats after a reconnect`() {
         val s = Setup(user())
         s.connect()
@@ -256,7 +273,7 @@ class VitafitVT701HandlerTest {
     @Test
     fun `drops a replay of the last stored measurement after an app restart`() {
         val stored = ScaleMeasurement().apply {
-            dateTime = Date(System.currentTimeMillis() - 60_000)
+            dateTime = Date(System.currentTimeMillis() - 20_000)
             this[MeasurementType.WEIGHT] = Kg(86.85f)
         }
         val s = Setup(user(), lastStored = stored)

@@ -53,7 +53,8 @@ import com.health.openscale.core.data.Percent
  *    arrives (as phase 3 only). `attr` was 0x21 in every capture (2 decimals, kg).
  *  - About 2.3 s after the last stable/final frame the scale sends cmd 0x11 with the raw
  *    whole-body impedance: `[00 00 00 00 00][z_hi][z_lo]` in Ω, or 0xFFFF if no impedance
- *    could be measured (shoes/socks, stepped off). The phone acks with `a5 05 26 11 00`.
+ *    could be measured (shoes/socks, stepped off). The phone acks with `a5 05 26 11 00`;
+ *    the scale still repeats a real impedance every 2.5 s until it gets results page 2.
  *  - The Vitafit app then sends its own body-composition results back for the scale's
  *    display (cmd 0x15, two pages). That payload is only partly decoded and is not sent here.
  *
@@ -294,8 +295,13 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         /** Observed gap from the last stable/final frame to the impedance frame is ~2.3 s. */
         const val IMPEDANCE_TIMEOUT_MS = 5000L
 
-        /** A final frame equal to a measurement stored this recently is a replay. */
-        const val REPLAY_WINDOW_MS = 5 * 60 * 1000L
+        /**
+         * A final frame equal to a measurement stored this recently is a replay. A replay needs
+         * the scale to be still awake (it switches off ~25 s after its last frame and repeats the
+         * impedance frame every 2.5 s until then), while the same weight can genuinely recur
+         * within minutes, so the window is kept short.
+         */
+        const val REPLAY_WINDOW_MS = 60 * 1000L
 
         /**
          * Weight in raw 0.01 kg units from a valid type 0x10 frame whose phase is stable (0x02) or
