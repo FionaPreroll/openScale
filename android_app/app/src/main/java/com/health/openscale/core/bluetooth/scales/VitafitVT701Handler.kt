@@ -469,10 +469,9 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
 
         /**
          * A stable/final frame at the start of a connection equal to a measurement stored this
-         * recently is a replay. A replay needs
-         * the scale to be still awake (it switches off ~25 s after its last frame and repeats the
-         * impedance frame every 2.5 s until then), while the same weight can genuinely recur
-         * within minutes, so the window is kept short.
+         * recently is a replay. Replays were seen 21–44 s after the stored measurement (device
+         * logs 2026-11-20), while the same weight can genuinely recur within minutes, so the
+         * window is kept short.
          */
         const val REPLAY_WINDOW_MS = 60 * 1000L
 

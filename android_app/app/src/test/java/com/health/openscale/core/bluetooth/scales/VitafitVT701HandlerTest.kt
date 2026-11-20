@@ -346,6 +346,41 @@ class VitafitVT701HandlerTest {
     }
 
     @Test
+    fun `handles the replay and re-weigh of the device log of 2026-11-20 12_51`() {
+        val s = Setup(user())
+        // 12:50:48: connected while standing still; 79.35 kg, no impedance (socks).
+        s.connect()
+        repeat(3) { s.notify("5a 0a 26 10 02 00 00 21 1e ff fe aa") }
+        s.notify("5a 0b 26 11 00 00 00 00 00 ff ff 3c aa")
+        s.notify("5a 05 26 15 01 37 aa")
+        s.notify("5a 05 26 15 02 34 aa")
+        assertThat(s.published).hasSize(1)
+        assertThat(s.disconnects).isEqualTo(1)
+        s.disconnected()
+
+        // 12:51:33: reconnect; the scale replays the result as phase 3, then the impedance frame.
+        s.connect()
+        s.writes.clear()
+        repeat(2) { s.notify("5a 0a 26 10 03 00 00 21 1e ff ff aa") }
+        repeat(2) { s.notify("5a 0b 26 11 00 00 00 00 00 ff ff 3c aa") }
+        s.notify("5a 05 26 15 01 37 aa")
+        s.notify("5a 05 26 15 02 34 aa")
+        assertThat(s.published).hasSize(1)
+        assertThat(s.writes.count { it.second.startsWith("a50f2615") }).isEqualTo(2)
+        assertThat(s.disconnects).isEqualTo(1)
+
+        // 12:51:39: the user steps on again; same weight, stored as a new weigh-in.
+        s.notify("5a 0a 26 10 00 00 00 21 07 21 3b aa")
+        s.notify("5a 0a 26 10 01 00 00 21 1e 46 44 aa")
+        repeat(7) { s.notify("5a 0a 26 10 02 00 00 21 1e ff fe aa") }
+        s.notify("5a 0b 26 11 00 00 00 00 00 ff ff 3c aa")
+        assertThat(s.published).hasSize(2)
+        assertThat(s.published.last()[MeasurementType.WEIGHT]!!.value).isWithin(1e-3f).of(79.35f)
+        s.notify("5a 05 26 15 02 34 aa")
+        assertThat(s.disconnects).isEqualTo(2)
+    }
+
+    @Test
     fun `drops a replay of the last stored measurement after an app restart`() {
         val stored = ScaleMeasurement().apply {
             dateTime = Date(System.currentTimeMillis() - 20_000)
