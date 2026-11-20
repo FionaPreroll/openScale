@@ -30,6 +30,8 @@ object BackgroundSession {
         ENDED,
         /** The connection never started within the start timeout. */
         NEVER_STARTED,
+        /** The connector kept searching for the scale without connecting (it went back to sleep). */
+        NOT_CONNECTED,
         /** The connection was still open when the session timeout ran out. */
         TIMED_OUT,
     }
@@ -41,9 +43,17 @@ object BackgroundSession {
         ConnectionStatus.BROADCAST_LISTENING,
     )
     private val FINISHED = setOf(ConnectionStatus.DISCONNECTED, ConnectionStatus.FAILED)
+    private val UP = setOf(ConnectionStatus.CONNECTED, ConnectionStatus.BROADCAST_LISTENING)
 
     /** True if a connection is under way, e.g. one the user started in the app. */
     fun isActive(status: ConnectionStatus): Boolean = status in ACTIVE
+
+    /**
+     * True while the link to the scale is being set up or is up. A presence event in that state is
+     * the system reporting our own connection (EVENT_BT_CONNECTED), not the scale coming back.
+     */
+    fun isLinkUp(status: ConnectionStatus): Boolean =
+        status == ConnectionStatus.CONNECTING || status == ConnectionStatus.CONNECTED
 
     /**
      * Waits until the connection that was just requested has started and then ended.
@@ -53,10 +63,15 @@ object BackgroundSession {
     suspend fun awaitEnd(
         status: StateFlow<ConnectionStatus>,
         startTimeoutMs: Long,
+        connectTimeoutMs: Long,
         sessionTimeoutMs: Long,
     ): Outcome {
         withTimeoutOrNull(startTimeoutMs) { status.first { it in ACTIVE } }
             ?: return Outcome.NEVER_STARTED
+        // The connector scans for the scale without a limit of its own.
+        val reached = withTimeoutOrNull(connectTimeoutMs) { status.first { it in UP || it in FINISHED } }
+            ?: return Outcome.NOT_CONNECTED
+        if (reached in FINISHED) return Outcome.ENDED
         withTimeoutOrNull(sessionTimeoutMs) { status.first { it in FINISHED } }
             ?: return Outcome.TIMED_OUT
         return Outcome.ENDED

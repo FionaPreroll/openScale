@@ -17,7 +17,12 @@
  */
 package com.health.openscale.ui.screen.settings
 
+import android.Manifest
 import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -55,6 +60,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -66,11 +72,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavController
 import com.health.openscale.R
@@ -351,9 +361,29 @@ private fun SettingsSectionTitle(
 private fun BackgroundMeasurementRow(vm: BackgroundMeasurementViewModel, sharedViewModel: SharedViewModel) {
     val enabled by vm.enabled.collectAsStateWithLifecycle()
     val busy by vm.busy.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         vm.onConfirmationResult(result.resultCode == Activity.RESULT_OK)
     }
+
+    // Result notifications need POST_NOTIFICATIONS (Android 13+). The measurement itself works
+    // without it, so a denial does not stop the switch.
+    fun notificationsAllowed(): Boolean = NotificationManagerCompat.from(context).areNotificationsEnabled()
+    var notificationsGranted by remember { mutableStateOf(notificationsAllowed()) }
+    LifecycleResumeEffect(Unit) {
+        notificationsGranted = notificationsAllowed()
+        onPauseOrDispose { }
+    }
+    val requestNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        notificationsGranted = granted
+        vm.setEnabled(true)
+    }
+    fun switchOn() {
+        val mayAsk = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (mayAsk) requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS) else vm.setEnabled(true)
+    }
+
     LaunchedEffect(vm) {
         vm.confirmation.collect { sender -> launcher.launch(IntentSenderRequest.Builder(sender).build()) }
     }
@@ -370,13 +400,36 @@ private fun BackgroundMeasurementRow(vm: BackgroundMeasurementViewModel, sharedV
             if (vm.isSupported) R.string.background_measurement_desc else R.string.background_measurement_unsupported
         ),
         icon        = Icons.Default.Sensors,
-        onClick     = if (canToggle) ({ vm.setEnabled(!enabled) }) else null
+        onClick     = if (canToggle) ({ if (enabled) vm.setEnabled(false) else switchOn() }) else null
     ) {
         Switch(
             checked         = enabled,
             onCheckedChange = null,
             enabled         = canToggle,
         )
+    }
+    if (enabled && !notificationsGranted) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 56.dp, end = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = stringResource(R.string.background_measurement_notifications_off),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = {
+                // Works after a permanent denial too, and when notifications are blocked.
+                context.startActivity(
+                    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }) {
+                Text(stringResource(R.string.background_measurement_notifications_allow))
+            }
+        }
     }
 }
 

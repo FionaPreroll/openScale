@@ -60,27 +60,44 @@ class BackgroundMeasurementService : Service() {
     private val TAG = "BackgroundMeasurement"
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var session: Job? = null
+    @Volatile private var rerunRequested = false
+    private var lastStartId = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
         if (!enterForeground()) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
-        if (session?.isActive == true) {
-            LogManager.d(TAG, "Session already running; ignoring start")
+            if (session?.isActive != true) stopSelf(startId)
             return START_NOT_STICKY
         }
         val address = intent?.getStringExtra(EXTRA_ADDRESS)
+        if (session?.isActive == true) {
+            // While our link is being set up or is up, the system reports it as the scale being
+            // present again. Once the link is closed, a new event means the scale is still (or
+            // again) advertising: the system will not report it again while it stays present, so
+            // run another session right after this one instead of dropping the event.
+            val status = entryPoint().bluetoothFacade().connectionStatus.value
+            if (BackgroundSession.isLinkUp(status)) {
+                LogManager.d(TAG, "Presence event for our own connection ($status); ignoring")
+            } else {
+                LogManager.i(TAG, "Scale reappeared while the session finishes ($status); measuring again afterwards")
+                rerunRequested = true
+            }
+            return START_NOT_STICKY
+        }
         session = scope.launch {
             try {
-                runSession(address)
+                do {
+                    rerunRequested = false
+                    runSession(address)
+                } while (rerunRequested)
             } catch (t: Throwable) {
                 LogManager.e(TAG, "Background measurement failed", t)
             } finally {
                 ServiceCompat.stopForeground(this@BackgroundMeasurementService, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                // Keeps the service if a start is already on its way; that start runs a new session.
+                stopSelf(lastStartId)
             }
         }
         return START_NOT_STICKY
@@ -91,8 +108,11 @@ class BackgroundMeasurementService : Service() {
         super.onDestroy()
     }
 
+    private fun entryPoint(): BackgroundMeasurementEntryPoint =
+        EntryPointAccessors.fromApplication(applicationContext, BackgroundMeasurementEntryPoint::class.java)
+
     private suspend fun runSession(address: String?) {
-        val entryPoint = EntryPointAccessors.fromApplication(applicationContext, BackgroundMeasurementEntryPoint::class.java)
+        val entryPoint = entryPoint()
         val bluetooth = entryPoint.bluetoothFacade()
         val saved = entryPoint.settingsFacade().observeSavedDevice().first()
 
@@ -118,19 +138,20 @@ class BackgroundMeasurementService : Service() {
                 LogManager.w(TAG, "Saved device or user not available; not connecting")
                 return
             }
-            when (BackgroundSession.awaitEnd(bluetooth.connectionStatus, START_TIMEOUT_MS, SESSION_TIMEOUT_MS)) {
-                BackgroundSession.Outcome.ENDED -> LogManager.i(TAG, "Background session ended")
-                BackgroundSession.Outcome.NEVER_STARTED -> LogManager.w(TAG, "Connection did not start")
-                BackgroundSession.Outcome.TIMED_OUT -> {
-                    LogManager.w(TAG, "Session timed out; disconnecting")
-                    bluetooth.disconnect()
-                }
+            val outcome = BackgroundSession.awaitEnd(
+                bluetooth.connectionStatus, START_TIMEOUT_MS, CONNECT_TIMEOUT_MS, SESSION_TIMEOUT_MS,
+            )
+            LogManager.i(TAG, "Background session finished: $outcome")
+            if (outcome != BackgroundSession.Outcome.ENDED) {
+                // Stop the connector's search/link so the next presence event can connect again.
+                bluetooth.disconnect()
             }
             // The connector reports saved measurements debounced by 700 ms.
             delay(RESULT_GRACE_MS)
         } finally {
             collector.cancel()
         }
+        LogManager.d(TAG, "Result messages: ${results.size}")
         results.lastOrNull()?.let { showResult(it) }
     }
 
@@ -141,7 +162,7 @@ class BackgroundMeasurementService : Service() {
     // --- notifications ---------------------------------------------------------------------------
 
     private fun enterForeground(): Boolean {
-        ensureChannel()
+        ensureChannels()
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification_foreground)
             .setContentTitle(getString(R.string.background_measurement_running))
@@ -162,13 +183,16 @@ class BackgroundMeasurementService : Service() {
     private fun showResult(text: String) {
         val allowed = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
-        if (!allowed) return
+        if (!allowed) {
+            LogManager.w(TAG, "POST_NOTIFICATIONS not granted; no result notification ($text)")
+            return
+        }
         val open = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        val notification = NotificationCompat.Builder(this, RESULT_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification_foreground)
             .setContentTitle(getString(R.string.background_measurement_title))
             .setContentText(text)
@@ -176,25 +200,35 @@ class BackgroundMeasurementService : Service() {
             .setAutoCancel(true)
             .build()
         NotificationManagerCompat.from(this).notify(RESULT_ID, notification)
+        LogManager.i(TAG, "Result notification shown: $text")
     }
 
-    private fun ensureChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            getString(R.string.background_measurement_channel),
-            NotificationManager.IMPORTANCE_LOW,
+    private fun ensureChannels() {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, getString(R.string.background_measurement_channel), NotificationManager.IMPORTANCE_LOW)
         )
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        manager.createNotificationChannel(
+            NotificationChannel(
+                RESULT_CHANNEL_ID,
+                getString(R.string.background_measurement_result_channel),
+                NotificationManager.IMPORTANCE_DEFAULT,
+            )
+        )
     }
 
     companion object {
         private const val EXTRA_ADDRESS = "address"
         private const val CHANNEL_ID = "background_measurement"
+        private const val RESULT_CHANNEL_ID = "background_measurement_result"
         private const val ONGOING_ID = 0x5CA1E
         private const val RESULT_ID = 0x5CA1F
 
         /** Time for the connector to start connecting after the request. */
         const val START_TIMEOUT_MS = 15_000L
+
+        /** Time to find and connect the scale; it stays awake ~25 s after its last frame. */
+        const val CONNECT_TIMEOUT_MS = 30_000L
 
         /** Upper bound for one weigh-in; the scale itself switches off much earlier. */
         const val SESSION_TIMEOUT_MS = 120_000L
