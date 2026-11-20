@@ -152,6 +152,9 @@ class VitafitVT701HandlerTest {
         // 2026-11-19: 80.30 kg was weighed five times within four minutes; those are real.
         assertThat(VitafitVT701Handler.isSameWeighIn(8030, t0 + 2 * 60_000, 8030, t0)).isFalse()
         assertThat(VitafitVT701Handler.isSameWeighIn(8685, t0, -1, 0L)).isFalse()
+        val stable = VitafitVT701Handler.STABLE_REPLAY_WINDOW_MS
+        assertThat(VitafitVT701Handler.isSameWeighIn(8685, t0 + 10_000, 8685, t0, stable)).isTrue()
+        assertThat(VitafitVT701Handler.isSameWeighIn(8685, t0 + 30_000, 8685, t0, stable)).isFalse()
     }
 
     // --- weigh-in flow -------------------------------------------------------------------------
@@ -309,6 +312,37 @@ class VitafitVT701HandlerTest {
         // The next weigh-in in this connection is stored, even with the same weight.
         liveWeighInWithImpedance.forEach { s.notify(it) }
         assertThat(s.published).hasSize(2)
+    }
+
+    @Test
+    fun `stores a late-connected weigh-in with the same weight as one a minute ago`() {
+        // Device log 2026-11-20 12:38:51: the first connection attempt failed, the second one
+        // started with stable frames of 79.45 kg, 67 s after a stored 79.45 kg weigh-in.
+        val stored = ScaleMeasurement().apply {
+            dateTime = Date(System.currentTimeMillis() - 30_000)
+            this[MeasurementType.WEIGHT] = Kg(79.45f)
+        }
+        val s = Setup(user(), lastStored = stored)
+        s.connect()
+        repeat(3) { s.notify("5a 0a 26 10 02 00 00 21 1f 09 09 aa") }
+        s.notify("5a 0b 26 11 00 00 00 00 00 ff ff 3c aa")
+
+        assertThat(s.published).hasSize(1)
+        assertThat(s.published.single()[MeasurementType.WEIGHT]!!.value).isWithin(1e-3f).of(79.45f)
+    }
+
+    @Test
+    fun `drops stable frames of the measurement stored seconds ago`() {
+        val stored = ScaleMeasurement().apply {
+            dateTime = Date(System.currentTimeMillis() - 5_000)
+            this[MeasurementType.WEIGHT] = Kg(79.45f)
+        }
+        val s = Setup(user(), lastStored = stored)
+        s.connect()
+        repeat(3) { s.notify("5a 0a 26 10 02 00 00 21 1f 09 09 aa") }
+        s.notify("5a 0b 26 11 00 00 00 00 00 ff ff 3c aa")
+
+        assertThat(s.published).isEmpty()
     }
 
     @Test

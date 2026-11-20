@@ -183,8 +183,9 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
                 if (ignoringReplay) return
                 // A connection that starts with stable/final frames equal to the measurement just
                 // stored is the scale repeating it (e.g. the reconnect after a background weigh-in).
+                val window = if (reading.phase == PHASE_FINAL) REPLAY_WINDOW_MS else STABLE_REPLAY_WINDOW_MS
                 if (!sawLiveFrames && latchedWeightRaw < 0 &&
-                    isReplay(reading.weightRaw, System.currentTimeMillis(), user)
+                    isReplay(reading.weightRaw, System.currentTimeMillis(), user, window)
                 ) {
                     logI("Vitafit: ${reading.weightRaw / 100.0f} kg (phase ${reading.phase}) repeats the stored measurement; ignoring")
                     ignoringReplay = true
@@ -234,13 +235,13 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         }
     }
 
-    private fun isReplay(weightRaw: Int, nowMs: Long, user: ScaleUser): Boolean {
-        if (isSameWeighIn(weightRaw, nowMs, lastPublishedRaw, lastPublishedAtMs)) return true
+    private fun isReplay(weightRaw: Int, nowMs: Long, user: ScaleUser, windowMs: Long): Boolean {
+        if (isSameWeighIn(weightRaw, nowMs, lastPublishedRaw, lastPublishedAtMs, windowMs)) return true
         // Also catches a replay after openScale was restarted between the two connections.
         val last = lastMeasurementFor(user.id) ?: return false
         val lastKg = last[MeasurementType.WEIGHT]?.value ?: return false
         val lastAt = last.dateTime?.time ?: return false
-        return isSameWeighIn(weightRaw, nowMs, Math.round(lastKg * 100f), lastAt)
+        return isSameWeighIn(weightRaw, nowMs, Math.round(lastKg * 100f), lastAt, windowMs)
     }
 
     private fun publishMeasurement(
@@ -476,6 +477,15 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         const val REPLAY_WINDOW_MS = 60 * 1000L
 
         /**
+         * Shorter window for a connection that starts with stable frames. That is also how a
+         * genuine weigh-in looks when the link came up late (2026-11-20 12:38:51: 79.45 kg again,
+         * 67 s after the stored 79.45 kg, after a failed connection attempt), and the same weight
+         * recurs easily. A replay in this form is expected from the background reconnect, which
+         * starts within a few seconds of the stored measurement.
+         */
+        const val STABLE_REPLAY_WINDOW_MS = 20 * 1000L
+
+        /**
          * Weight in raw 0.01 kg units from a valid type 0x10 frame whose phase is stable (0x02) or
          * final (0x03), or `null` if the frame is malformed, not a weight frame, or still settling.
          *
@@ -525,10 +535,16 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
          * True if a stable/final frame with [weightRaw] at [nowMs] repeats a weigh-in that was
          * stored as [lastRaw] at [lastAtMs].
          */
-        fun isSameWeighIn(weightRaw: Int, nowMs: Long, lastRaw: Int, lastAtMs: Long): Boolean {
+        fun isSameWeighIn(
+            weightRaw: Int,
+            nowMs: Long,
+            lastRaw: Int,
+            lastAtMs: Long,
+            windowMs: Long = REPLAY_WINDOW_MS,
+        ): Boolean {
             if (lastRaw < 0) return false
             val age = nowMs - lastAtMs
-            return abs(weightRaw - lastRaw) <= 1 && age in 0..REPLAY_WINDOW_MS
+            return abs(weightRaw - lastRaw) <= 1 && age in 0..windowMs
         }
 
         /** True if [frame] is a well-formed scale frame with a matching XOR checksum. */
