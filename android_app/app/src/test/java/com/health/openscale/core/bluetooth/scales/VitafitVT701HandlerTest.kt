@@ -283,6 +283,35 @@ class VitafitVT701HandlerTest {
     }
 
     @Test
+    fun `drops a replay in the stable phase and shows the stored results again`() {
+        // Background mode reconnects right after a weigh-in, possibly while the user still stands.
+        val s = Setup(user(heightCm = 170f, age = 40))
+        s.connect()
+        liveWeighInWithImpedance.forEach { s.notify(it) }
+        s.notify("5a 05 26 15 02 34 aa")
+        assertThat(s.published).hasSize(1)
+        assertThat(s.disconnects).isEqualTo(1)
+        val pages = s.writes.map { it.second }.filter { it.startsWith("a50f2615") }
+        assertThat(pages).hasSize(2)
+
+        s.disconnected()
+        s.connect()
+        s.writes.clear()
+        repeat(3) { s.notify("5a 0a 26 10 02 00 00 21 22 74 49 aa") }   // 88.20 kg again
+        repeat(2) { s.notify("5a 0b 26 11 00 00 00 00 00 01 e4 d9 aa") }
+
+        assertThat(s.published).hasSize(1)
+        // Same pages as for the original weigh-in, sent once; the link stays open.
+        assertThat(s.writes.map { it.second }.filter { it.startsWith("a50f2615") })
+            .containsExactlyElementsIn(pages).inOrder()
+        assertThat(s.disconnects).isEqualTo(1)
+
+        // The next weigh-in in this connection is stored, even with the same weight.
+        liveWeighInWithImpedance.forEach { s.notify(it) }
+        assertThat(s.published).hasSize(2)
+    }
+
+    @Test
     fun `drops a replay of the last stored measurement after an app restart`() {
         val stored = ScaleMeasurement().apply {
             dateTime = Date(System.currentTimeMillis() - 20_000)

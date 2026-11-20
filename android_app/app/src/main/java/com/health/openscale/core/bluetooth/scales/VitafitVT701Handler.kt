@@ -67,8 +67,9 @@ import com.health.openscale.core.data.Percent
  * are sent back for the scale's display, rated with [MeasurementEvaluator] like in the app.
  *
  * One weigh-in is published at most once per connection, after which the link is closed. The
- * scale repeats its last final result when it is reconnected while still awake; such a replay
- * of the measurement that was just stored is recognised and dropped.
+ * scale may repeat its last result (as stable or final frames) when it is reconnected while still
+ * awake; such a replay of the measurement that was just stored is recognised and dropped, and the
+ * stored results are sent to the LCD again.
  */
 class VitafitVT701Handler : ScaleDeviceHandler() {
 
@@ -85,10 +86,12 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
     private var fallbackJob: Job? = null
     private var awaitingResultsAck = false
     private var resultsAckJob: Job? = null
+    private var answeredReplay = false
 
     // --- kept across connections: ScaleFactory reuses one handler instance ---
     private var lastPublishedRaw = -1
     private var lastPublishedAtMs = 0L
+    private var lastResultPages: List<ByteArray>? = null
 
     override fun supportFor(device: ScannedDeviceInfo): DeviceSupport? {
         if (!device.name.startsWith("Vitafit", ignoreCase = true)) return null
@@ -116,6 +119,7 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         awaitingResultsAck = false
         resultsAckJob?.cancel()
         resultsAckJob = null
+        answeredReplay = false
 
         setNotifyOn(service, notifyCharacteristic)
 
@@ -177,10 +181,12 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
             }
             PHASE_STABLE, PHASE_FINAL -> {
                 if (ignoringReplay) return
-                if (reading.phase == PHASE_FINAL && !sawLiveFrames && latchedWeightRaw < 0 &&
+                // A connection that starts with stable/final frames equal to the measurement just
+                // stored is the scale repeating it (e.g. the reconnect after a background weigh-in).
+                if (!sawLiveFrames && latchedWeightRaw < 0 &&
                     isReplay(reading.weightRaw, System.currentTimeMillis(), user)
                 ) {
-                    logI("Vitafit: final ${reading.weightRaw / 100.0f} kg repeats the stored measurement; ignoring")
+                    logI("Vitafit: ${reading.weightRaw / 100.0f} kg (phase ${reading.phase}) repeats the stored measurement; ignoring")
                     ignoringReplay = true
                     return
                 }
@@ -199,7 +205,17 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         if (published) return
         writeTo(service, writeCharacteristic, buildCommand(CMD_IMPEDANCE, byteArrayOf(0x00)))
         // Impedance without a latched weight belongs to an ignored replay or a lost weigh-in.
-        if (latchedWeightRaw < 0) return
+        if (latchedWeightRaw < 0) {
+            // Answer a replay like the original weigh-in: the pages keep the LCD on the results
+            // (instead of "Err") and stop the impedance repeats. The link stays open.
+            val pages = lastResultPages
+            if (ignoringReplay && !answeredReplay && pages != null) {
+                answeredReplay = true
+                logD("Vitafit: sending the stored results again for the replay")
+                pages.forEach { writeTo(service, writeCharacteristic, it) }
+            }
+            return
+        }
         publishMeasurement(latchedWeightRaw, ohm, user)
     }
 
@@ -300,7 +316,9 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
      * page writes went out.
      */
     private fun showResultsAndDisconnect(values: DisplayValues) {
-        buildResultPages(values).forEach { writeTo(service, writeCharacteristic, it) }
+        val pages = buildResultPages(values)
+        lastResultPages = pages
+        pages.forEach { writeTo(service, writeCharacteristic, it) }
         awaitingResultsAck = true
         resultsAckJob?.cancel()
         resultsAckJob = scope.launch {
@@ -449,7 +467,8 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         const val IMPEDANCE_TIMEOUT_MS = 5000L
 
         /**
-         * A final frame equal to a measurement stored this recently is a replay. A replay needs
+         * A stable/final frame at the start of a connection equal to a measurement stored this
+         * recently is a replay. A replay needs
          * the scale to be still awake (it switches off ~25 s after its last frame and repeats the
          * impedance frame every 2.5 s until then), while the same weight can genuinely recur
          * within minutes, so the window is kept short.
@@ -503,8 +522,8 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         fun parseImpedanceOhm(frame: ByteArray): Int? = decodeImpedance(frame)?.ohm
 
         /**
-         * True if a final frame with [weightRaw] at [nowMs] repeats a weigh-in that was stored as
-         * [lastRaw] at [lastAtMs].
+         * True if a stable/final frame with [weightRaw] at [nowMs] repeats a weigh-in that was
+         * stored as [lastRaw] at [lastAtMs].
          */
         fun isSameWeighIn(weightRaw: Int, nowMs: Long, lastRaw: Int, lastAtMs: Long): Boolean {
             if (lastRaw < 0) return false

@@ -51,9 +51,14 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /**
- * Foreground service (type connectedDevice) that runs one measurement when the saved scale
+ * Foreground service (type connectedDevice) that runs a measurement when the saved scale
  * appears: connect through the normal [BluetoothFacade] path, let the scale handler store the
  * measurement, wait for the link to close, then stop. Started by [ScalePresenceService].
+ *
+ * After a saved measurement it connects once more and keeps that link until the scale switches
+ * itself off (~25 s after its last frame), so a second weigh-in right after the first one is
+ * caught too: the system does not always report the scale again after a disconnect (no
+ * presence event for 21 s in the device log of 2026-11-20 although the scale was awake).
  */
 class BackgroundMeasurementService : Service() {
 
@@ -90,8 +95,10 @@ class BackgroundMeasurementService : Service() {
             try {
                 do {
                     rerunRequested = false
-                    runSession(address)
-                } while (rerunRequested)
+                    val measured = runSession(address)
+                    val again = measured || rerunRequested
+                    if (measured) LogManager.i(TAG, "Measurement saved; reconnecting until the scale switches off")
+                } while (again)
             } catch (t: Throwable) {
                 LogManager.e(TAG, "Background measurement failed", t)
             } finally {
@@ -111,7 +118,8 @@ class BackgroundMeasurementService : Service() {
     private fun entryPoint(): BackgroundMeasurementEntryPoint =
         EntryPointAccessors.fromApplication(applicationContext, BackgroundMeasurementEntryPoint::class.java)
 
-    private suspend fun runSession(address: String?) {
+    /** Runs one connection; returns true if it saved a measurement. */
+    private suspend fun runSession(address: String?): Boolean {
         val entryPoint = entryPoint()
         val bluetooth = entryPoint.bluetoothFacade()
         val saved = entryPoint.settingsFacade().observeSavedDevice().first()
@@ -120,23 +128,25 @@ class BackgroundMeasurementService : Service() {
             // The association belongs to a scale that is no longer the saved one.
             LogManager.i(TAG, "Scale $address is not the saved device (${saved?.address}); removing its association")
             entryPoint.scalePresenceManager().disable(address)
-            return
+            return false
         }
         if (BackgroundSession.isActive(bluetooth.connectionStatus.value)) {
             LogManager.i(TAG, "A connection is already active; nothing to do")
-            return
+            return false
         }
 
         val results = mutableListOf<String>()
+        var measured = false
         val collector = scope.launch {
             bluetooth.snackbarEventsFromConnector.collect { event ->
                 if (event.messageResId in RESULT_MESSAGES) resolve(event)?.let { results += it }
+                if (event.messageResId in SAVED_MESSAGES) measured = true
             }
         }
         try {
             if (!bluetooth.connectToSavedDeviceInBackground()) {
                 LogManager.w(TAG, "Saved device or user not available; not connecting")
-                return
+                return false
             }
             val outcome = BackgroundSession.awaitEnd(
                 bluetooth.connectionStatus, START_TIMEOUT_MS, CONNECT_TIMEOUT_MS, SESSION_TIMEOUT_MS,
@@ -153,6 +163,7 @@ class BackgroundMeasurementService : Service() {
         }
         LogManager.d(TAG, "Result messages: ${results.size}")
         results.lastOrNull()?.let { showResult(it) }
+        return measured
     }
 
     private fun resolve(event: SnackbarEvent): String? =
@@ -234,11 +245,11 @@ class BackgroundMeasurementService : Service() {
         const val SESSION_TIMEOUT_MS = 120_000L
         private const val RESULT_GRACE_MS = 1_500L
 
-        private val RESULT_MESSAGES = setOf(
+        private val SAVED_MESSAGES = setOf(
             R.string.bluetooth_connector_measurement_saved,
             R.string.saved_measurements_message,
-            R.string.bluetooth_connector_measurement_user_missing,
         )
+        private val RESULT_MESSAGES = SAVED_MESSAGES + R.string.bluetooth_connector_measurement_user_missing
 
         fun start(context: Context, address: String) {
             val intent = Intent(context, BackgroundMeasurementService::class.java).putExtra(EXTRA_ADDRESS, address)
