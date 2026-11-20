@@ -271,12 +271,17 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
                 measurement[MeasurementType.BONE] = Kg(lib.boneMassKg.toFloat())
                 measurement[MeasurementType.BMR] = Kcal(lib.basalMetabolicRate.toFloat())
                 val fat = lib.totalFatPercentage.toFloat()
+                val water = lib.totalBodyWaterPercentage.toFloat()
+                val muscle = lib.skeletalMusclePercentage.toFloat()
                 display = display.copy(
                     fatPercent = fat,
                     fatLevel = levelFor(MeasurementEvaluator.evalBodyFat(fat, user.age, user.gender).state),
-                    waterPercent = lib.totalBodyWaterPercentage.toFloat(),
-                    musclePercent = lib.skeletalMusclePercentage.toFloat(),
+                    waterPercent = water,
+                    waterLevel = levelFor(MeasurementEvaluator.evalWater(water, user.age, user.gender).state),
+                    musclePercent = muscle,
+                    muscleLevel = levelFor(MeasurementEvaluator.evalMuscle(muscle, user.age, user.gender).state),
                     boneKg = lib.boneMassKg.toFloat(),
+                    proteinPercent = proteinPercent(lib.fatFreeMassKg, lib.totalBodyWaterKg, lib.boneMassKg, weightKg.toDouble()),
                     bmrKcal = lib.basalMetabolicRate.toFloat(),
                 )
             } else {
@@ -336,8 +341,11 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         val fatPercent: Float? = null,
         val fatLevel: Int = 0,
         val waterPercent: Float? = null,
+        val waterLevel: Int = 0,
         val musclePercent: Float? = null,
+        val muscleLevel: Int = 0,
         val boneKg: Float? = null,
+        val proteinPercent: Float? = null,
         val bmi: Float? = null,
         val bmiLevel: Int = 0,
         val bmrKcal: Float? = null,
@@ -391,22 +399,33 @@ class VitafitVT701Handler : ScaleDeviceHandler() {
         }
 
         /**
-         * The two cmd 0x15 frames for the LCD. Slots that openScale does not compute (protein,
-         * subcutaneous fat, visceral fat, metabolic age) are sent as 0 ("--"). The muscle screen
-         * shows openScale's MUSCLE value (skeletal muscle %).
+         * Protein % for the LCD's PR screen: the fat-free mass that is neither water nor bone,
+         * the same definition the Vitafit app uses (muscle % − water %). Only shown on the scale,
+         * openScale does not store it. `null` if the inputs do not give a positive value.
+         */
+        fun proteinPercent(fatFreeMassKg: Double, waterKg: Double, boneKg: Double, weightKg: Double): Float? {
+            if (weightKg <= 0.0) return null
+            val pct = (fatFreeMassKg - waterKg - boneKg) / weightKg * 100.0
+            return if (pct.isFinite() && pct > 0.0) pct.toFloat() else null
+        }
+
+        /**
+         * The two cmd 0x15 frames for the LCD. Slots that openScale does not compute
+         * (subcutaneous fat, visceral fat, metabolic age) are sent as 0. The muscle screen shows
+         * openScale's MUSCLE value (skeletal muscle %).
          *
          * Page 1: body fat % ×10, water % ×10, muscle % ×10, bone kg ×100, BMI ×10.
-         * Page 2: protein, skeletal muscle % ×10, subcutaneous fat, BMR kcal, visceral fat/metabolic age.
+         * Page 2: protein % ×10, skeletal muscle % ×10, subcutaneous fat, BMR kcal, visceral fat/metabolic age.
          */
         fun buildResultPages(v: DisplayValues): List<ByteArray> {
             val page1 = intArrayOf(
                 slot(v.fatPercent, 10, v.fatLevel, BODY_FAT_VALUE_MASK),
-                slot(v.waterPercent, 10),
-                slot(v.musclePercent, 10),
+                slot(v.waterPercent, 10, v.waterLevel),
+                slot(v.musclePercent, 10, v.muscleLevel),
                 slot(v.boneKg, 100),
                 slot(v.bmi, 10, v.bmiLevel),
             )
-            val page2 = intArrayOf(0, slot(v.musclePercent, 10), 0, slot(v.bmrKcal, 1), 0)
+            val page2 = intArrayOf(slot(v.proteinPercent, 10), slot(v.musclePercent, 10), 0, slot(v.bmrKcal, 1), 0)
             return listOf(resultsPage(1, page1), resultsPage(2, page2))
         }
 

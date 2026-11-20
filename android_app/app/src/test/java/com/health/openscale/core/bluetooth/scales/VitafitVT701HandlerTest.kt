@@ -20,6 +20,7 @@ package com.health.openscale.core.bluetooth.scales
 import com.google.common.truth.Truth.assertThat
 import com.health.openscale.core.bluetooth.data.ScaleMeasurement
 import com.health.openscale.core.bluetooth.data.ScaleUser
+import com.health.openscale.core.bluetooth.libs.StandardImpedanceLib
 import com.health.openscale.core.data.EvaluationState
 import com.health.openscale.core.data.GenderType
 import com.health.openscale.core.data.Kg
@@ -354,14 +355,16 @@ class VitafitVT701HandlerTest {
     fun `builds the results pages with values and rating levels`() {
         val pages = VitafitVT701Handler.buildResultPages(
             VitafitVT701Handler.DisplayValues(
-                fatPercent = 31.1f, fatLevel = 3, waterPercent = 49.6f, musclePercent = 35.3f,
-                boneKg = 3.46f, bmi = 30.5f, bmiLevel = 3, bmrKcal = 1682f,
+                fatPercent = 31.1f, fatLevel = 3, waterPercent = 49.6f, waterLevel = 2,
+                musclePercent = 35.3f, muscleLevel = 1, boneKg = 3.46f, proteinPercent = 15.4f,
+                bmi = 30.5f, bmiLevel = 3, bmrKcal = 1682f,
             )
         )
-        // Page 1: fat 0x6137 (level 3, 311), water 496, muscle 353, bone 346, BMI 0x6131.
-        assertThat(pages[0]).isEqualTo(hex("a5 0f 26 15 01 61 37 01 f0 01 61 01 5a 61 31 f1 aa"))
-        // Page 2: protein --, skeletal muscle 353, subcutaneous fat --, BMR 1682, VF/age --.
-        assertThat(pages[1]).isEqualTo(hex("a5 0f 26 15 02 00 00 01 61 00 00 06 92 00 00 ca aa"))
+        // Page 1: fat 0x6137 (level 3, 311), water 0x41f0 (level 2, 496), muscle 0x2161
+        // (level 1, 353), bone 346, BMI 0x6131 (level 3, 305).
+        assertThat(pages[0]).isEqualTo(hex("a5 0f 26 15 01 61 37 41 f0 21 61 01 5a 61 31 91 aa"))
+        // Page 2: protein 154, skeletal muscle 353, subcutaneous fat --, BMR 1682, VF/age --.
+        assertThat(pages[1]).isEqualTo(hex("a5 0f 26 15 02 00 9a 01 61 00 00 06 92 00 00 50 aa"))
     }
 
     @Test
@@ -383,16 +386,34 @@ class VitafitVT701HandlerTest {
     }
 
     @Test
-    fun `rates body fat and BMI like the app and leaves the rest unrated`() {
-        // Male, 35 years, 180 cm, 88.20 kg, 484 Ohm: BMI 27.2 and body fat ~26 % are both high.
+    fun `rates the values like the app and sends the protein`() {
+        // Male, 35 years, 180 cm, 88.20 kg, 484 Ohm: body fat ~26 % and BMI 27.2 are high,
+        // water ~53 % (50–65) and skeletal muscle ~38 % (34.1–44.1) are normal; bone is unrated.
         val s = Setup(user(heightCm = 180f, age = 35))
         s.connect()
         liveWeighInWithImpedance.forEach { s.notify(it) }
 
-        val page1 = s.writes.first { it.second.startsWith("a50f261501") }.second
-        val words = (0 until 5).map { page1.substring(10 + 4 * it, 14 + 4 * it).toInt(16) }
-        assertThat(words.map { it shr 13 }).containsExactly(3, 0, 0, 0, 3).inOrder()
-        assertThat((words[4] and 0x1FFF) / 10f).isWithin(0.051f).of(88.20f / (1.8f * 1.8f))
+        fun words(prefix: String) = s.writes.first { it.second.startsWith(prefix) }.second
+            .let { frame -> (0 until 5).map { frame.substring(10 + 4 * it, 14 + 4 * it).toInt(16) } }
+        val page1 = words("a50f261501")
+        assertThat(page1.map { it shr 13 }).containsExactly(3, 2, 2, 0, 3).inOrder()
+        assertThat((page1[4] and 0x1FFF) / 10f).isWithin(0.051f).of(88.20f / (1.8f * 1.8f))
+
+        // Protein = (FFM - water - bone) / weight, from the same StandardImpedanceLib values.
+        val lib = StandardImpedanceLib(GenderType.MALE, 35, 88.20, 1.8, 484.0)
+        val expected = (lib.fatFreeMassKg - lib.totalBodyWaterKg - lib.boneMassKg) / 88.20 * 100
+        val page2 = words("a50f261502")
+        assertThat(page2[0] / 10.0).isWithin(0.051).of(expected)
+        assertThat(page2[0] shr 13).isEqualTo(0)
+    }
+
+    @Test
+    fun `computes the protein like the vendor app`() {
+        // Vendor app, 2025-08-09: FFM 61.56 kg, water 47.3 % of 88.20 kg, bone 3.11 kg -> 19.0 %.
+        val protein = VitafitVT701Handler.proteinPercent(61.56, 0.473 * 88.20, 3.11, 88.20)
+        assertThat(protein!!.toDouble()).isWithin(0.05).of(19.0)
+        assertThat(VitafitVT701Handler.proteinPercent(40.0, 45.0, 3.0, 80.0)).isNull()
+        assertThat(VitafitVT701Handler.proteinPercent(60.0, 40.0, 3.0, 0.0)).isNull()
     }
 
     @Test
